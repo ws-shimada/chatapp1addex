@@ -24,7 +24,6 @@ import pytz # convert timezone
 global now # get time from user's PC
 now = datetime.datetime.now(pytz.timezone('Asia/Tokyo'))
 ## library firebase
-import firebase_admin
 from google.oauth2 import service_account
 from google.cloud import firestore
 import json
@@ -38,8 +37,22 @@ import json
 # LANGCHAIN_API_KEY=userdata.get('langchain_api_key')
 # LANGCHAIN_PROJECT="chatapptest202501"
 ## langchain
-OPENAI_API_KEY=st.secrets.openai_api_key
 MODEL_NAME="gpt-4-1106-preview"
+SLEEP_TIME_LIST = [5, 5, 5, 5, 5] # 各対話ターンの待機時間
+DISPLAY_TEXT_LIST = ['「原子力発電を廃止すべきか否か」という意見に対して、あなたの意見を入力し、送信ボタンを押してください。',
+                     'あなたの意見を入力し、送信ボタンを押してください。']
+QUALTRICS_URL = "hogehoge"
+try:
+    OPENAI_API_KEY = st.secrets["openai_api_key"]
+except Exception:
+    st.error("OpenAI APIキーが設定されていません。`secrets.toml` を確認してください。")
+    st.stop()
+try:
+    FIREBASE_APIKEY_DICT = json.loads(st.secrets["firebase"]["textkey"])
+except Exception as e:
+    st.error(f"Firebase の認証情報の読み込みに失敗しました: {e}")
+    st.stop()
+
 ## chat act config
 FPATH = "preprompt_affirmative_individualizing_nuclear.txt"
 try:
@@ -48,17 +61,15 @@ try:
 except FileNotFoundError:
     st.error("システムプロンプトファイルが見つかりません。デプロイ時に同じディレクトリに配置してください。")
     st.stop()
-SLEEP_TIME_LIST = [5, 5, 5, 5, 5] # 各対話ターンの待機時間
-DISPLAY_TEXT_LIST = ['「原子力発電を廃止すべきか否か」という意見に対して、あなたの意見を入力し、送信ボタンを押してください。',
-                     'あなたの意見を入力し、送信ボタンを押してください。']
-QUALTRICS_URL = "hogehoge"
-FIREBASE_APIKEY_DICT = json.loads(st.secrets["firebase"]["textkey"])
+
+# id check
 if not "sessionid" in st.query_params:
     st.error("ユーザーIDが設定されていません。URLを確認してください")
     st.stop()
 if not "user_id" in st.session_state:
-    st.session_state.user_id = st.query_params["sessionid"] 
-OPENAI_API_KEY=st.secrets.openai_api_key
+    st.session_state.user_id = st.query_params["sessionid"]
+if "user_id" in st.session_state:
+    config = {"configurable": {"thread_id": st.session_state.user_id}}
 
 class State(TypedDict):
     # Messages have the type "list". The `add_messages` function
@@ -76,8 +87,6 @@ prompt = ChatPromptTemplate.from_messages(
     ]
 )
 chain = prompt | llm
-if "user_id" in st.session_state:
-    config = {"configurable": {"thread_id": st.session_state.user_id}}
 if not "memory" in st.session_state:
     st.session_state.memory = MemorySaver()
 
@@ -96,7 +105,6 @@ def stream_graph_updates(user_input: str) -> str | None:
     try:
         events = graph.stream({"messages": [("user", user_input)]},
                               config, stream_mode="values")
-
         ai_text = None
         for event in events:
             messages = event["messages"]
@@ -124,6 +132,10 @@ except Exception as e:
 
 # 入力時の動作
 def submitted():
+    user_input = st.session_state.last_input
+    if user_input is None or len(str(user_input).strip()) == 0:
+        st.error("内部エラー：ユーザー入力が取得できませんでした。最初からやり直してください。")
+        st.stop()
     chat_placeholder = st.empty()
     with chat_placeholder.container():
         for i in range(len(st.session_state.log)):
@@ -143,6 +155,7 @@ def submitted():
             # talktime を進めない / Firestoreにも書かない
             st.session_state.state = 1
             st.stop()
+        st.session_state.log.append({"role": "ai", "content": ai_reply})
         if st.session_state.firestore_available:
             try:
                 doc_ref = db.collection(str(st.session_state.user_id)).document(str(st.session_state.talktime))
