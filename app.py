@@ -47,10 +47,13 @@ with open(file = FPATH, encoding = "utf-8") as f:
 SLEEP_TIME_LIST = [5, 5, 5, 5, 5] # 各対話ターンの待機時間
 DISPLAY_TEXT_LIST = ['「原子力発電を廃止すべきか否か」という意見に対して、あなたの意見を入力し、送信ボタンを押してください。',
                      'あなたの意見を入力し、送信ボタンを押してください。']
-QUALTRICS_URL = "https://nagoyapsychology.qualtrics.com/jfe/form/SV_1YXssOhyFAzPQea/"
+QUALTRICS_URL = “hogehoge"
 FIREBASE_APIKEY_DICT = json.loads(st.secrets["firebase"]["textkey"])
+if not "sessionid" in st.query_params:
+    st.error("ユーザーIDが設定されていません。URLを確認してください")
+    st.stop()
 if not "user_id" in st.session_state:
-    st.session_state.user_id = st.query_params["sessionid"]
+    st.session_state.user_id = st.query_params["sessionid"] 
 OPENAI_API_KEY=st.secrets.openai_api_key
 
 class State(TypedDict):
@@ -85,26 +88,35 @@ graph_builder.add_edge(START, "chatbot")
 graph_builder.add_edge("chatbot", END)
 graph = graph_builder.compile(checkpointer=st.session_state.memory)
 
-def stream_graph_updates(user_input: str):
+def stream_graph_updates(user_input: str) -> str | None:
     try:
-        events = graph.stream({"messages": [("user", user_input)]}, config, stream_mode="values")
+        events = graph.stream({"messages": [("user", user_input)]},
+                              config, stream_mode="values")
+
+        ai_text = None
         for event in events:
             messages = event["messages"]
-            msg_list = []
-            for value in range(len(messages)):
-                msg_list.append({
-                    "role": messages[value].type,
-                    "content": messages[value].content
-                })
-        return msg_list
+            for m in messages:
+                # LangGraph/LC のメッセージ型に合わせてここ調整
+                if m.type in ("ai", "assistant"):
+                    ai_text = m.content
+        return ai_text
     except Exception as e:
-        st.error(f"Error occurred: {e}")
-        return []
+        # ログを壊さない
+        st.session_state.last_error = f"llm_error: {e}"
+        st.error("AIの応答でエラーが発生しました。時間をおいて再度お試しください。")
+        return None
 
 # Firebase 設定の読み込み
-creds = service_account.Credentials.from_service_account_info(FIREBASE_APIKEY_DICT)
-project_id = FIREBASE_APIKEY_DICT["project_id"]
-db = firestore.Client(credentials=creds, project=project_id)
+
+try:
+    creds = service_account.Credentials.from_service_account_info(FIREBASE_APIKEY_DICT)
+    project_id = FIREBASE_APIKEY_DICT["project_id"]
+    db = firestore.Client(credentials=creds, project=project_id)
+    st.session_state.firestore_available = True
+except Exception as e:
+    st.session_state.firestore_available = False
+    st.error("Firestore の初期化に失敗しました。ログはクラウドに保存されません。")
 
 # 入力時の動作
 def submitted():
@@ -119,22 +131,27 @@ def submitted():
     with st.spinner("相手からの返信を待っています..."):
         sleep(SLEEP_TIME_LIST[st.session_state.talktime])
         st.session_state.return_time = str(datetime.datetime.now(pytz.timezone('Asia/Tokyo')))
-        user_input = next((msg["content"] for msg in reversed(st.session_state.log) if msg["role"] == "human"),
-                          None  # 条件に一致するものがなかった場合のデフォルト値
-                         )
-        st.session_state.log = stream_graph_updates(user_input)
-        doc_ref = db.collection(str(st.session_state.user_id)).document(str(st.session_state.talktime))
-        doc_ref.set({
-            "bottype" : "indi",
-            "Human": next((msg["content"] for msg in reversed(st.session_state.log) if msg["role"] == "human"),
-                       None  # 条件に一致するものがなかった場合のデフォルト値
-                      ),
-            "AI": next((msg["content"] for msg in reversed(st.session_state.log) if msg["role"] == "ai"),
-                       None  # 条件に一致するものがなかった場合のデフォルト値
-                      ),
-            "Human_msg_sended": st.session_state.send_time,
-            "AI_msg_returned": st.session_state.return_time,
-        })
+        user_input = st.session_state.last_input
+        ai_reply = stream_graph_updates(st.session_state.last_input)
+        if ai_reply is None or len(str(ai_reply).strip()) == 0:
+            # 人間の発言はもう log に乗っているので、それだけ残す
+            st.warning("今回は相手からの返信を取得できませんでした。もう一度お試しください。")
+            # talktime を進めない / Firestoreにも書かない
+            st.session_state.state = 1
+            st.stop()
+        if st.session_state.firestore_available:
+            try:
+                doc_ref = db.collection(str(st.session_state.user_id)).document(str(st.session_state.talktime))
+                doc_ref.set({
+                    "bottype": "indi",
+                    "Human": user_input,
+                    "AI": ai_reply,
+                    "Human_msg_sended": st.session_state.send_time,
+                    "AI_msg_returned": st.session_state.return_time,
+                })
+            except Exception as e:
+                st.session_state.last_error = f"firestore_error: {e}"
+                st.warning("ログの保存に失敗しました（Firestore）。ローカルのダウンロードログを必ず確保してください。")
         st.session_state.talktime += 1
         st.session_state.state = 1
         st.rerun()
@@ -145,29 +162,41 @@ def chat_page():
         st.session_state.talktime = 0
     if "log" not in st.session_state:
         st.session_state.log = []
+    
     chat_placeholder = st.empty()
     with chat_placeholder.container():
-        for i in range(len(st.session_state.log)):
-            msg = st.session_state.log[i]
+        for i, msg in enumerate(st.session_state.log):
             if msg["role"] == "human":
-                message(msg["content"], is_user=True, avatar_style="adventurer", seed="Nala", key=f"user_{i}")
+                message(
+                    msg["content"],
+                    is_user=True,
+                    avatar_style="adventurer",
+                    seed="Nala",
+                    key=f"user_{i}",
+                )
             else:
-                message(msg["content"], is_user=False, avatar_style="micah", key=f"ai_{i}")
+                message(
+                    msg["content"],
+                    is_user=False,
+                    avatar_style="micah",
+                    key=f"ai_{i}",
+                )
     if st.session_state.talktime < 5:  # 会話時
-        if not "user_input" in st.session_state:
-            st.session_state.user_input = "hogehoge"
         with st.container():
+            prompt_text = DISPLAY_TEXT_LIST[0] if st.session_state.talktime == 0 else DISPLAY_TEXT_LIST[1]
             with st.form("chat_form", clear_on_submit=True, enter_to_submit=False):
-                if st.session_state.talktime == 0:
-                    user_input = st.text_area(DISPLAY_TEXT_LIST[0])
-                else:
-                    user_input = st.text_area(DISPLAY_TEXT_LIST[1])
+                user_input = st.text_area(prompt_text, key="chat_input")
                 submit_msg = st.form_submit_button(
                     label="送信",
                     type="primary")
             if submit_msg:
+                cleaned = user_input.strip()
+                if len(cleaned) == 0:
+                    st.warning("1文字以上入力してください。")
+                    st.stop()
+                st.session_state.log.append({"role": "human", "content": cleaned})
+                st.session_state.last_input = cleaned
                 st.session_state.send_time = str(datetime.datetime.now(pytz.timezone('Asia/Tokyo')))
-                st.session_state.log.append({"role": "human", "content": user_input})
                 st.session_state.state = 2
                 st.rerun()
     elif st.session_state.talktime == 5:  # 会話終了時
