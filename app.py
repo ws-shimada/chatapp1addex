@@ -42,12 +42,16 @@ OPENAI_API_KEY=st.secrets.openai_api_key
 MODEL_NAME="gpt-4-1106-preview"
 ## chat act config
 FPATH = "preprompt_affirmative_individualizing_nuclear.txt"
-with open(file = FPATH, encoding = "utf-8") as f:
-    SYSTEM_PROMPT = f.read()
+try:
+    with open(FPATH, encoding="utf-8") as f:
+        SYSTEM_PROMPT = f.read()
+except FileNotFoundError:
+    st.error("システムプロンプトファイルが見つかりません。デプロイ時に同じディレクトリに配置してください。")
+    st.stop()
 SLEEP_TIME_LIST = [5, 5, 5, 5, 5] # 各対話ターンの待機時間
 DISPLAY_TEXT_LIST = ['「原子力発電を廃止すべきか否か」という意見に対して、あなたの意見を入力し、送信ボタンを押してください。',
                      'あなたの意見を入力し、送信ボタンを押してください。']
-QUALTRICS_URL = “hogehoge"
+QUALTRICS_URL = "hogehoge"
 FIREBASE_APIKEY_DICT = json.loads(st.secrets["firebase"]["textkey"])
 if not "sessionid" in st.query_params:
     st.error("ユーザーIDが設定されていません。URLを確認してください")
